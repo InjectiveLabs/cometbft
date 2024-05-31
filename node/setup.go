@@ -13,6 +13,8 @@ import (
 
 	dbm "github.com/cometbft/cometbft-db"
 
+	"github.com/cosmos/gogoproto/proto"
+
 	abci "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/blocksync"
 	cfg "github.com/cometbft/cometbft/config"
@@ -28,6 +30,7 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/pex"
 	"github.com/cometbft/cometbft/privval"
+	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/cometbft/cometbft/proxy"
 	sm "github.com/cometbft/cometbft/state"
 	"github.com/cometbft/cometbft/state/indexer"
@@ -118,6 +121,56 @@ func initDBs(config *cfg.Config, dbProvider cfg.DBProvider) (blockStore *store.B
 	}
 
 	return
+}
+
+func initInjDBs(config *cfg.Config, dbProvider cfg.DBProvider, genesisDocProvider GenesisDocProvider) (blockStore *store.BlockStore, stateDB dbm.DB, err error) {
+	var blockStoreDB dbm.DB
+	blockStoreDB, err = dbProvider(&cfg.DBContext{ID: "blockstore", Config: config})
+	if err != nil {
+		return
+	}
+
+	stateDB, err = dbProvider(&cfg.DBContext{ID: "state", Config: config})
+	if err != nil {
+		return
+	}
+
+	_ = sm.NewStore(stateDB, sm.StoreOptions{
+		DiscardABCIResponses: config.Storage.DiscardABCIResponses,
+	})
+
+	state, _, err := LoadStateFromDBOrGenesisDocProvider(stateDB, genesisDocProvider)
+	if err != nil {
+		return nil, nil, err
+	}
+	bz, err := blockStoreDB.Get(calcSeenCommitKey(state.LastBlockHeight))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Modify blockstore
+	pbc := new(cmtproto.Commit)
+	err = proto.Unmarshal(bz, pbc)
+	if err != nil {
+		panic(fmt.Sprintf("error unmarshal : %v", err))
+	}
+
+	// Flag commit
+	pbc.Signatures[0].BlockIdFlag = 2
+
+	bz, err = proto.Marshal(pbc)
+	if err != nil {
+		panic(fmt.Sprintf("error marshal : %v", err))
+	}
+	blockStoreDB.Set(calcSeenCommitKey(state.LastBlockHeight), bz)
+
+	blockStore = store.NewBlockStore(blockStoreDB)
+
+	return
+}
+
+func calcSeenCommitKey(height int64) []byte {
+	return []byte(fmt.Sprintf("SC:%v", height))
 }
 
 func createAndStartProxyAppConns(clientCreator proxy.ClientCreator, logger log.Logger, metrics *proxy.Metrics) (proxy.AppConns, error) {
